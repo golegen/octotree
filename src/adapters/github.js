@@ -30,7 +30,8 @@ const GH_RESERVED_USER_NAMES = [
   'mirrors',
   'open-source',
   'personal',
-  'pricing'
+  'pricing',
+  'marketplace',
 ];
 const GH_RESERVED_REPO_NAMES = ['followers', 'following', 'repositories'];
 const GH_404_SEL = '#parallax_wrapper';
@@ -38,6 +39,7 @@ const GH_PJAX_CONTAINER_SEL = '#js-repo-pjax-container, .context-loader-containe
 const GH_CONTAINERS = '.container, .container-lg, .container-responsive';
 const GH_HEADER = '.js-header-wrapper > header';
 const GH_RAW_CONTENT = 'body > pre';
+const GH_MAX_HUGE_REPOS_SIZE = 50;
 
 class GitHub extends PjaxAdapter {
   constructor(store) {
@@ -73,8 +75,15 @@ class GitHub extends PjaxAdapter {
   }
 
   // @override
-  canLoadEntireTree() {
-    return true;
+  canLoadEntireTree(repo) {
+    const key = `${repo.username}/${repo.reponame}`;
+    const hugeRepos = this.store.get(STORE.HUGE_REPOS);
+    if (hugeRepos[key]) {
+      // Update the last load time of the repo
+      hugeRepos[key] = new Date().getTime();
+      this.store.set(STORE.HUGE_REPOS, hugeRepos);
+    }
+    return !hugeRepos[key];
   }
 
   // @override
@@ -100,8 +109,8 @@ class GitHub extends PjaxAdapter {
       shouldPushEverything || (!togglerVisible && !sidebarVisible)
         ? '' // Nothing is visible or already pushed, leave as-is
         : !sidebarVisible
-          ? 25 // Sidebar is collapsed, move the logo to avoid hiding the toggler
-          : sidebarWidth; // Otherwise, move the header from the sidebar
+        ? 25 // Sidebar is collapsed, move the logo to avoid hiding the toggler
+        : sidebarWidth; // Otherwise, move the header from the sidebar
     $header.css('padding-left', headerPadding);
   }
 
@@ -141,15 +150,39 @@ class GitHub extends PjaxAdapter {
       return cb();
     }
 
-    // Get branch by inspecting URL or DOM, quite fragile so provide multiple fallbacks
-    const branchDropdownMenu = $('.branch-select-menu');
+    // Get branch by inspecting URL or DOM, quite fragile so provide multiple fallbacks.
+    // TODO would be great if there's a more robust way to do this
+    /**
+     * Github renders the branch name in one of below structure depending on the length
+     * of branch name
+     *
+     * Option 1: when the length is short enough
+     * <summary title="Switch branches or tags">
+     *   <span class="css-truncate-target">feature/1/2/3</span>
+     * </summary>
+     *
+     * Option 2: when the length is too long
+     * <summary title="feature/1/2/3/4/5/6/7/8">
+     *   <span class="css-truncate-target">feature/1/2/3...</span>
+     * </summary>
+     */
+    const branchDropdownMenuSummary = $('.branch-select-menu summary');
+    const branchNameInTitle = branchDropdownMenuSummary.attr('title');
+    const branchNameInSpan = branchDropdownMenuSummary.find('span').text();
+    const branchFromSummary =
+      branchNameInTitle && branchNameInTitle.toLowerCase().startsWith('switch branches')
+        ? branchNameInSpan
+        : branchNameInTitle;
+
     const branch =
       // Pick the commit ID as branch name when the code page is listing tree in a particular commit
       (type === 'commit' && typeId) ||
-      // Pick the commit ID or branch name from the Branch dropdown menu
-      // Note: we can't use URL as it would not work with branches with slashes, e.g. features/hotfix-1
-      $('.select-menu-item.selected', branchDropdownMenu).data('name') ||
-      $('.select-menu-button span', branchDropdownMenu).text() ||
+      // Pick the commit ID or branch name from the DOM
+      branchFromSummary ||
+      ($('.overall-summary .numbers-summary .commits a').attr('href') || '').replace(
+        `/${username}/${reponame}/commits/`,
+        ''
+      ) ||
       // Pull requests page
       ($('.commit-ref.base-ref').attr('title') || ':').match(/:(.*)/)[1] ||
       // Reuse last selected branch if exist
@@ -306,6 +339,18 @@ class GitHub extends PjaxAdapter {
     $.ajax(cfg)
       .done((data) => {
         if (path && path.indexOf('/git/trees') === 0 && data.truncated) {
+          const hugeRepos = this.store.get(STORE.HUGE_REPOS);
+          const repo = `${opts.repo.username}/${opts.repo.reponame}`;
+          const repos = Object.keys(hugeRepos);
+          if (!hugeRepos[repo]) {
+            // If there are too many repos memoized, delete the oldest one
+            if (repos.length >= GH_MAX_HUGE_REPOS_SIZE) {
+              const oldestRepo = repos.reduce((min, p) => hugeRepos[p] < hugeRepos[min] ? p : min);
+              delete hugeRepos[oldestRepo];
+            }
+            hugeRepos[repo] = new Date().getTime();
+            this.store.set(STORE.HUGE_REPOS, hugeRepos);
+          }
           this._handleError({status: 206}, cb);
         } else cb(null, data);
       })
